@@ -118,7 +118,7 @@ class RecurrentModel(nn.Module):
             ds, _ = nn.utils.rnn.pad_packed_sequence(ds, batch_first=False)
             x = x.data
         
-        return ds, a, e, h, x # return y for no vox level FOD network??? *** y makes it more unstable it seems?
+        return ds, a, e, h
 
 class CosineLoss(nn.Module):
 
@@ -129,8 +129,6 @@ class CosineLoss(nn.Module):
     def forward(self, yp, y, m):
 
         mask = m / torch.sum(m)
-        
-        dot_loss = 1 - torch.sum(yp * y, dim=-1)
-        dot_loss_masked = torch.sum(dot_loss * mask)
-
-        return dot_loss_masked
+        loss = 1 - torch.sum(yp * y, dim=-1)
+        loss = torch.sum(loss * mask)
+        return loss

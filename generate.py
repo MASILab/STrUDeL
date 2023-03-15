@@ -6,7 +6,7 @@
 
 import os
 import subprocess
-import argparse as ap
+import sys
 import numpy as np
 import nibabel as nib
 from datetime import datetime
@@ -18,15 +18,6 @@ from dipy.io.stateful_tractogram import Space, StatefulTractogram
 
 from utils import vox2trid, vox2trii, triinterp
 from modules import RecurrentModel
-
-# Shared Variables
-
-CORNN_DIR = os.getenv('CORNN_DIR')
-MODEL_DIR = os.path.join(CORNN_DIR, 'model')
-SRC_DIR   = os.path.join(CORNN_DIR, 'src')
-VENV_DIR  = os.path.join(CORNN_DIR, 'venv')
-
-SCIL_DIR  = os.getenv('SCIL_DIR')
 
 # Helper Functions
 
@@ -75,7 +66,7 @@ def img2seeds(seed_img):
 
     return seed_vox
 
-def seeds2streamlines(seed_vox, seed_step, seed_trid, seed_trii, seed_hidden, seed_max_steps, angle_steps, rnn, ten, device):
+def seeds2streamlines(seed_vox, seed_step, seed_trid, seed_trii, seed_hidden, seed_max_steps, buffer_steps, rnn, ten, device):
 
     # Prep outputs
 
@@ -100,14 +91,14 @@ def seeds2streamlines(seed_vox, seed_step, seed_trid, seed_trii, seed_hidden, se
         # Given information about previous point, compute/analyze current point
 
         with torch.no_grad():
-            curr_step, _, _, curr_hidden, _ = rnn(ten.to(device), torch.FloatTensor(prev_trid).to(device), torch.LongTensor(prev_trii), h=prev_hidden.to(device))
+            curr_step, _, _, curr_hidden = rnn(ten.to(device), torch.FloatTensor(prev_trid).to(device), torch.LongTensor(prev_trii), h=prev_hidden.to(device))
         
         curr_step = curr_step[0].cpu().numpy()
         curr_vox = prev_vox + curr_step / 2 # 2mm resolution to 1mm steps (1mm steps in 2mm voxel space have length 0.5)
         curr_trid = vox2trid(curr_vox)
-        curr_trii = vox2trii(curr_vox, t1_img)
+        curr_trii = vox2trii(curr_vox, seed_img)
         
-        curr_terminate, curr_reject = tri2act(curr_trid, curr_trii, curr_step, prev_trid, prev_trii, prev_step, step, seed_max_steps, act_img, mask_img, ignore_angle=step<angle_steps)
+        curr_terminate, curr_reject = tri2act(curr_trid, curr_trii, curr_step, prev_trid, prev_trii, prev_step, step, seed_max_steps, act_img, mask_img, ignore_angle=step<buffer_steps)
 
         # Update streamlines criteria: ACT
 
@@ -147,16 +138,6 @@ def seeds2streamlines(seed_vox, seed_step, seed_trid, seed_trii, seed_hidden, se
 
     return streamlines_vox, streamlines_terminate, streamlines_reject
 
-def ten2features(ten, cnn, device):
-
-    cnn = cnn.to(device)
-    cnn.eval()
-    with torch.no_grad():
-        ten = cnn(ten.to(device))
-    cnn = cnn.cpu()
-    ten = ten.cpu()
-    return ten.cpu()
-
 def streamlines2reverse(streamlines_vox, streamlines_terminate, streamlines_reject, rnn, ten, device):
 
     # Reverse and reject streamlines and convert to trii/trid, noting NaNs
@@ -190,6 +171,8 @@ def streamlines2reverse(streamlines_vox, streamlines_terminate, streamlines_reje
     # Compute hidden states batch-wise
 
     num_batches = np.median(np.sum(rev_vox_nan, axis=0)).astype(int)                                # Make each batch contain roughly the same number of total steps as there are streamlines
+    if num_batches == 0:                                                                            # Consider edge case where num_batches is 0
+        num_batches += 1
     rev_batch_idxs = np.round(np.linspace(0, rev_valid_num, num_batches+1)).astype(int)             # since we know we can fit 1 step per streamline and all streamlines on the GPU    
 
     rnn = rnn.to(device)
@@ -202,7 +185,7 @@ def streamlines2reverse(streamlines_vox, streamlines_terminate, streamlines_reje
         batch_rev_trii = torch.nn.utils.rnn.pack_sequence(rev_trii[rev_batch_idxs[i]:rev_batch_idxs[i+1]], enforce_sorted=False)
         batch_rev_lens = torch.LongTensor(rev_lens[rev_batch_idxs[i]:rev_batch_idxs[i+1]])                                          # Record length of each
         with torch.no_grad():
-            batch_rev_step, _, _, batch_rev_hidden, _ = rnn(ten, batch_rev_trid.to(device), batch_rev_trii)                         # Forward pass
+            batch_rev_step, _, _, batch_rev_hidden = rnn(ten, batch_rev_trid.to(device), batch_rev_trii)                         # Forward pass
             batch_rev_step = batch_rev_step.cpu()
             batch_rev_hidden = batch_rev_hidden.cpu()
         batch_rev_step = torch.stack([batch_rev_step[batch_rev_lens[k]-1, k, :] for k in range(batch_rev_step.shape[1])], dim=0)    # Extract last step of each
@@ -217,308 +200,123 @@ def streamlines2reverse(streamlines_vox, streamlines_terminate, streamlines_reje
     seed_step = np.concatenate(rev_step, axis=0)
     seed_vox = np.transpose(rev_vox[-1, :, :], axes=(1, 0)) + seed_step / 2 # (1mm steps in 2mm voxel space have length 0.5)
     seed_trid = vox2trid(seed_vox)
-    seed_trii = vox2trii(seed_vox, t1_img)
+    seed_trii = vox2trii(seed_vox, seed_img)
     seed_hidden = torch.cat(rev_hidden, dim=1)
     seed_max_steps = max_steps - np.array(rev_lens)
 
     return seed_vox, seed_step, seed_trid, seed_trii, seed_hidden, seed_max_steps, rev_valid
 
-def echo(msg):
-
-    print('generate.py: {}'.format(msg))
-    
-def run(cmd):
-
-    echo(cmd)
-    subprocess.check_call(cmd, shell=True, executable='/bin/bash')
-
 # Go!
 
 if __name__ == '__main__':
 
-    # --------------
-    # Prepare inputs
-    # --------------
+    fod_file     = sys.argv[1]
+    seed_file    = sys.argv[2]
+    mask_file    = sys.argv[3]
+    act_file     = sys.argv[4]
+    weights_file = sys.argv[5]
+    tck_file     = sys.argv[6]
 
-    parser = ap.ArgumentParser(description='CoRNN tractography with T1w MRI: Streamline propagation with convolutional-recurrent neural networks')
-    
-    parser.add_argument('t1_file', metavar='/in/file.nii.gz', help='path to the input NIFTI T1w MRI file')
-    parser.add_argument('out_file', metavar='/out/file.trk', help='path to the output tractogram file (trk, tck, vtk, fib, or dpy)')
-
-    parser.add_argument('--slant', metavar='/slant/dir', default=None, help='path to the SLANT output directory (required)')
-    parser.add_argument('--wml', metavar='/wml/dir', default=None, help='path to the WML TractSeg output directory (required)')
-
-    parser.add_argument('--device', metavar='cuda/cpu', default='cpu', help='string indicating device on which to perform tracking (default = "cpu")')
-    parser.add_argument('--num_streamlines', metavar='N', default='1000000', help='number of streamlines (default = 1000000)')
-    parser.add_argument('--num_seeds', metavar='N', default='100000', help='number of streamline seeds per batch (default = 100000)')
-    parser.add_argument('--min_steps', metavar='N', default='50', help='minimum number of 1mm steps for streamlines (default = 50)')
-    parser.add_argument('--max_steps', metavar='N', default='250', help='maximum number of 1mm steps for streamlines (default = 250)')
-    parser.add_argument('--buffer_steps', metavar='N', default='5', help='number of 1mm steps where the angle criteria is ignored at the beginning of tracking (default = 5)')
-    parser.add_argument('--unidirectional', action='store_true', help='perform only unidirectional tracking (default = bidirectional)')
-
-    parser.add_argument('--work_dir', metavar='/work/dir', default='/tmp/cornn_{}'.format(datetime.now().strftime('%m%d%Y_%H%M%S')), help='path to temporary working directory (default = make new directory in /tmp)')
-    parser.add_argument('--keep_work', action='store_true', help='do NOT remove working directory')
-    parser.add_argument('--num_threads', metavar='N', default=1, help='Non-negative integer indicating number of threads to use when running multi-threaded steps of this pipeline (default = 1)')
-    parser.add_argument('--force', action='store_true', help='force overwrite output')
-
-    args = parser.parse_args()
-
-    # ------------
-    # Parse inputs
-    # ------------
-
-    echo('Parsing inputs...')
-
-    t1_file = args.t1_file
-    assert os.path.exists(args.t1_file), 'Input T1 file {} does not exist. Aborting.'.format(t1_file)
-    echo('Input file:\t\t{}'.format(t1_file))
-
-    out_file = args.out_file
-    out_dir = os.path.dirname(out_file)
-    out_dir = '.' if out_dir == '' else out_dir
-    assert os.path.exists(out_dir), 'Output directory {} does not exist. Aborting.'.format(out_dir)
-    force = args.force
-    if force and os.path.exists(out_file):
-        echo('CAUTION! Output file {} will be overwritten.'.format(out_file))
-    else:
-        assert not os.path.exists(out_file), 'Output file {} already exists (use --force to overwrite). Aborting.'.format(out_file)
-    echo('Output file:\t\t{}'.format(out_file))
-    
-    slant_dir = str(args.slant)
-    assert os.path.exists(slant_dir), 'SLANT directory {} does not exist. Aborting.'.format(slant_dir)
-    echo('SLANT directory:\t\t{}'.format(slant_dir))
-    wml_dir = str(args.wml)
-    assert os.path.exists(wml_dir), 'WML TractSeg directory {} does not exist. Aborting.'.format(wml_dir)
-    echo('WML directory:\t\t{}'.format(wml_dir))
-    
-    device_str = args.device
-    assert device_str[:4] == 'cuda' or device_str == 'cpu', 'Device must either be cuda or cpu. Aborting.'
-    echo('Device:\t\t\t{}'.format(device_str))
-
-    num_seeds = int(args.num_seeds)
-    assert num_seeds > 0, 'Parameter num_seeds must be positive. {} provided. Aborting.'.format(num_seeds)
-    echo('Number of seeds:\t\t{}'.format(num_seeds))
-
-    max_steps = int(args.max_steps)
-    assert max_steps > 0, 'Parameter max_steps must be positive. {} provided. Aborting.'.format(max_steps)
-    min_steps = int(args.min_steps)
-    assert min_steps > 0, 'Parameter min_steps must be positive. {} provided. Aborting.'.format(min_steps)
-    assert min_steps < max_steps, 'Parameter min_steps must be less than max_steps. {} and {} were provided.'.format(min_steps, max_steps)
-    echo('Minimum steps:\t\t{}'.format(min_steps))
-    echo('Maximum steps:\t\t{}'.format(max_steps))
-
-    angle_steps = int(args.buffer_steps)
-    assert angle_steps > 0, 'Parameter buffer_steps must be positive. {} provided. Aborting.'.format(angle_steps)
-    echo('Buffer steps:\t\t{}'.format(angle_steps))
-
-    rev = not args.unidirectional
-    echo('Bidirectional:\t\t{}'.format(rev))
-
-    num_select = int(args.num_streamlines)
-    assert num_select > 0, 'Parameter num_streamlines must be positive. {} provided. Aborting.'.format(num_select)
-    echo('Number of streamlines:\t{}'.format(num_select))
-
-    work_dir = args.work_dir
-    if not os.path.exists(work_dir):
-        os.mkdir(work_dir)
-    echo('Working directory:\t\t{}'.format(work_dir))
-    
-    keep_work = args.keep_work
-    echo('Keep working directory:\t{}'.format(keep_work))
-
-    num_threads = int(args.num_threads)
-    assert num_threads > 0, 'Parameter num_threads must be positive. {} provided. Aborting.'.format(num_threads)
-    echo('Number of threads:\t\t{}'.format(num_threads))
-
-    # ---------------------------
-    # Move into working directory
-    # ---------------------------
-
-    echo('Moving into working directory...')
-    if not os.path.exists(os.path.join(work_dir, 'T1.nii.gz')):
-        convert_cmd = 'mrconvert {} {}'.format(t1_file, os.path.join(work_dir, 'T1.nii.gz'))
-        run(convert_cmd)
-    else:
-        echo('Output exists, skipping.')
-
-    # ----------
-    # Prepare T1
-    # ----------
-
-    echo('Preparing T1w MRI...')
-    t1_cmd = 'source {}/bin/activate ; bash {} {} {} {} {}'.format(VENV_DIR, os.path.join(SRC_DIR, 'prep_T1.sh'), work_dir, slant_dir, wml_dir, num_threads)
-    run(t1_cmd)
-
-    # -----------------
-    # Prepare inference
-    # -----------------
-
-    echo('Preparing for inference...')
-
-    # Load data
-
-    echo('Loading data...')
-
-    mask_img    = nib.load(os.path.join(work_dir, 'T1_mask_mni_2mm.nii.gz')).get_fdata().astype(bool)
-    seed_img    = nib.load(os.path.join(work_dir, 'T1_seed_mni_2mm.nii.gz')).get_fdata()
-
-    t1_nii      = nib.load(os.path.join(work_dir, 'T1_N4_mni_2mm.nii.gz'))
-    t1_img      = t1_nii.get_fdata()
-    t1_ten      = torch.FloatTensor(np.expand_dims(t1_img / np.median(t1_img[mask_img]), axis=(0, 1)))
-
-    act_img     = nib.load(os.path.join(work_dir, 'T1_5tt_mni_2mm.nii.gz')).get_fdata()[:, :, :, :-1]
-    act_ten     = torch.FloatTensor(np.expand_dims(np.transpose(act_img, axes=(3, 0, 1, 2)), axis=0))
-
-    tseg_img    = nib.load(os.path.join(work_dir, 'T1_tractseg_mni_2mm.nii.gz')).get_fdata()
-    tseg_ten    = torch.FloatTensor(np.expand_dims(np.transpose(tseg_img, axes=(3, 0, 1, 2)), axis=0))
-    
-    slant_img   = nib.load(os.path.join(work_dir, 'T1_slant_mni_2mm.nii.gz')).get_fdata()
-    slant_ten   = torch.FloatTensor(np.expand_dims(np.transpose(slant_img, axes=(3, 0, 1, 2)), axis=0))
-    
-    ten         = torch.cat((t1_ten, act_ten, tseg_ten, slant_ten), dim=1)
-    aff         = t1_nii.affine
+    buffer_steps = 5
+    min_steps = 50
+    max_steps = 250
+    num_seeds = 10000
+    num_select = 10000
 
     # Load model
 
-    echo('Loading model...')
+    print('Loading weights...')
 
-    device   = torch.device(device_str)
-    cnn      = DetConvProj(123, 512, kernel_size=7)
-    rnn      = RecurrentModel(512, fc_width=512, fc_depth=4, rnn_width=512, rnn_depth=2)
-    cnn.load_state_dict(torch.load(os.path.join(MODEL_DIR, 't1_cnn_e1073s1.pt'), map_location=torch.device('cpu')))
-    rnn.load_state_dict(torch.load(os.path.join(MODEL_DIR, 't1_rnn_e1073s1.pt'), map_location=torch.device('cpu')))
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    rnn    = RecurrentModel(45, fc_width=512, fc_depth=4, rnn_width=512, rnn_depth=2)
+    rnn.load_state_dict(torch.load(weights_file, map_location=torch.device('cpu')))
     
-    # -----------------------
-    # Inference (image-level)
-    # -----------------------
+    # Load FOD as a PyTorch Tensor
 
-    echo('Performing inference (image)...')
-    if not os.path.exists(os.path.join(work_dir, 'inference_mni_2mm.nii.gz')):
-        ten = ten2features(ten, cnn, device)
-        img = np.transpose(np.squeeze(ten.cpu().numpy(), axis=0), axes=(1, 2, 3, 0))
-        nii = nib.Nifti1Image(img, aff)
-        nib.save(nii, os.path.join(work_dir, 'inference_mni_2mm.nii.gz'))
-    else:
-        echo('Image inference already done, loading...')
-        nii = nib.load(os.path.join(work_dir, 'inference_mni_2mm.nii.gz'))
-        img = nii.get_fdata()
-        ten = torch.FloatTensor(np.expand_dims(np.transpose(img, axes=(3, 0, 1, 2)), axis=0))
+    print('Loading FOD...')
 
-    # --------------------
-    # Inference (tracking)
-    # --------------------
+    fod_nii = nib.load(fod_file)
+    fod_img = fod_nii.get_fdata()
+    fod     = torch.FloatTensor(np.expand_dims(np.transpose(fod_img, axes=(3, 0, 1, 2)), axis=0))
 
-    echo('Performing inference (tractography)...')
+    print('Loading masks...')
 
-    if not os.path.exists(os.path.join(work_dir, 'inference_mni_2mm.trk')):
+    seed_img = nib.load(seed_file).get_fdata().astype(bool)
+    mask_img = nib.load(mask_file).get_fdata().astype(bool)
+    act_img  = nib.load(act_file).get_fdata()[:, :, :, :-1]
+    
+    print('Performing tractography...')
+
+    # Loop through batches until number of desired streamlines are obtained
+
+    streamlines_selected = []
+    streamlines_selected_num = 0
+    batch = 0
+
+    while streamlines_selected_num < num_select:
+
+        # Forward tracking
+
+        # Generate forward seeds
+
+        seed_vox = img2seeds(seed_img)                                  # Floating point location in voxel space
+        seed_step = None                                                # Incoming angle to seed_vox (cartesian)
+        seed_trid = vox2trid(seed_vox)                                  # Distance to lower voxel in voxel space
+        seed_trii = vox2trii(seed_vox, seed_img)                        # Neighboring integer points in voxel space
+        seed_hidden = torch.zeros((2, num_seeds, 512))                  # Hidden state (initialize as zeros per PyTorch docs)
+        seed_max_steps = np.ones((num_seeds,)).astype(int) * max_steps  # Max number of propagating steps for each seed
+
+        # Track
+
+        streamlines_vox, streamlines_terminate, streamlines_reject = seeds2streamlines(seed_vox, seed_step, seed_trid, seed_trii, seed_hidden, seed_max_steps, buffer_steps, rnn, fod, device)
+
+        # Generate reverse seeds
+
+        rev_vox, rev_step, rev_trid, rev_trii, rev_hidden, rev_max_steps, rev_valid = streamlines2reverse(streamlines_vox[buffer_steps:, :, :], streamlines_terminate, streamlines_reject, rnn, fod, device)
         
-        # Loop through batches until number of desired streamlines are obtained
+        # Track
 
-        streamlines_selected = []
-        streamlines_selected_num = 0
-        batch = 0
+        rev_streamlines_vox, rev_streamlines_terminate, rev_streamlines_reject = seeds2streamlines(rev_vox, rev_step, rev_trid, rev_trii, rev_hidden, rev_max_steps, 0, rnn, fod, device)
+        
+        # Merge forward and reverse
 
-        while streamlines_selected_num < num_select:
+        joint_streamlines_vox = np.empty((rev_streamlines_vox.shape[0], rev_streamlines_vox.shape[1], num_seeds))
+        joint_streamlines_vox[:, :, rev_valid] = np.flip(rev_streamlines_vox, axis=0)
+        joint_streamlines_vox[:, :, np.logical_not(rev_valid)] = np.nan
+        joint_streamlines_vox = np.concatenate((joint_streamlines_vox, streamlines_vox[buffer_steps:, :, :]), axis=0)
 
-            # Forward tracking
+        streamlines_vox = joint_streamlines_vox
+        streamlines_reject[rev_valid] = np.logical_or(streamlines_reject[rev_valid], rev_streamlines_reject)
+        
+        # Reformat streamlines and remove those that are too short
 
-            # Generate forward seeds
+        streamlines_vox = np.split(streamlines_vox, streamlines_vox.shape[2], axis=2)
+        streamlines_empty = np.zeros((len(streamlines_vox),)).astype(bool)
+        for i in range(len(streamlines_vox)):
+            streamlines_vox[i] = np.squeeze(streamlines_vox[i])
+            keep_idxs = np.logical_not(np.all(np.isnan(streamlines_vox[i]), axis=1))
+            num_steps = np.sum(keep_idxs)
+            if num_steps == 0:
+                streamlines_empty[i] = True
+            if num_steps < min_steps + 1:
+                streamlines_reject[i] = True
+            streamlines_vox[i] = streamlines_vox[i][keep_idxs, :]
+        streamlines_vox = nib.streamlines.array_sequence.ArraySequence(streamlines_vox)
+        streamlines_vox = streamlines_vox[np.logical_not(streamlines_reject[np.logical_not(streamlines_empty)])]
 
-            seed_vox = img2seeds(seed_img)                                  # Floating point location in voxel space
-            seed_step = None                                                # Incoming angle to seed_vox (cartesian)
-            seed_trid = vox2trid(seed_vox)                                  # Distance to lower voxel in voxel space
-            seed_trii = vox2trii(seed_vox, seed_img)                        # Neighboring integer points in voxel space
-            seed_hidden = torch.zeros((2, num_seeds, 512))                  # Hidden state (initialize as zeros per PyTorch docs)
-            seed_max_steps = np.ones((num_seeds,)).astype(int) * max_steps  # Max number of propagating steps for each seed
+        # Update selected
 
-            # Track
+        streamlines_selected.append(streamlines_vox)
+        streamlines_selected_num += len(streamlines_vox)
+        print('Batch {}: {} seeds, {} ({:0.2f}%) selected, {} ({:0.2f}%) total'.format(batch, num_seeds, len(streamlines_vox), 100*len(streamlines_vox)/num_seeds, streamlines_selected_num, 100*streamlines_selected_num/num_select))
 
-            streamlines_vox, streamlines_terminate, streamlines_reject = seeds2streamlines(seed_vox, seed_step, seed_trid, seed_trii, seed_hidden, seed_max_steps, angle_steps, rnn, ten, device)
+        # Prepare for next batch
 
-            # Reverse tracking
+        batch += 1
 
-            if rev:
+    # Save tractogram
 
-                # Generate reverse seeds
-
-                rev_vox, rev_step, rev_trid, rev_trii, rev_hidden, rev_max_steps, rev_valid = streamlines2reverse(streamlines_vox[angle_steps:, :, :], streamlines_terminate, streamlines_reject, rnn, ten, device)
-                
-                # Track
-
-                rev_streamlines_vox, rev_streamlines_terminate, rev_streamlines_reject = seeds2streamlines(rev_vox, rev_step, rev_trid, rev_trii, rev_hidden, rev_max_steps, 0, rnn, ten, device)
-                
-                # Merge forward and reverse
-
-                joint_streamlines_vox = np.empty((rev_streamlines_vox.shape[0], rev_streamlines_vox.shape[1], num_seeds))
-                joint_streamlines_vox[:, :, rev_valid] = np.flip(rev_streamlines_vox, axis=0)
-                joint_streamlines_vox[:, :, np.logical_not(rev_valid)] = np.nan
-                joint_streamlines_vox = np.concatenate((joint_streamlines_vox, streamlines_vox[angle_steps:, :, :]), axis=0)
-
-                streamlines_vox = joint_streamlines_vox
-                streamlines_reject[rev_valid] = np.logical_or(streamlines_reject[rev_valid], rev_streamlines_reject)
-            
-            # Reformat streamlines and remove those that are too short
-
-            streamlines_vox = np.split(streamlines_vox, streamlines_vox.shape[2], axis=2)
-            streamlines_empty = np.zeros((len(streamlines_vox),)).astype(bool)
-            for i in range(len(streamlines_vox)):
-                streamlines_vox[i] = np.squeeze(streamlines_vox[i])
-                keep_idxs = np.logical_not(np.all(np.isnan(streamlines_vox[i]), axis=1))
-                num_steps = np.sum(keep_idxs)
-                if num_steps == 0:
-                    streamlines_empty[i] = True
-                if num_steps < min_steps + 1:
-                    streamlines_reject[i] = True
-                streamlines_vox[i] = streamlines_vox[i][keep_idxs, :]
-            streamlines_vox = nib.streamlines.array_sequence.ArraySequence(streamlines_vox)
-            streamlines_vox = streamlines_vox[np.logical_not(streamlines_reject[np.logical_not(streamlines_empty)])]
-
-            # Update selected
-
-            streamlines_selected.append(streamlines_vox)
-            streamlines_selected_num += len(streamlines_vox)
-            print('Batch {}: {} seeds, {} ({:0.2f}%) selected, {} ({:0.2f}%) total'.format(batch, num_seeds, len(streamlines_vox), 100*len(streamlines_vox)/num_seeds, streamlines_selected_num, 100*streamlines_selected_num/num_select))
-
-            # Prepare for next batch
-
-            batch += 1
-
-        # Save tractogram
-
-        streamlines_selected = nib.streamlines.array_sequence.concatenate(streamlines_selected, axis=0)
-        streamlines_selected = streamlines_selected[:num_select]
-        sft = StatefulTractogram(streamlines_selected, reference=t1_nii, space=Space.VOX)
-        save_tractogram(sft, os.path.join(work_dir, 'inference_mni_2mm.trk'), bbox_valid_check=False)
-
-    else:
-
-        echo('Tractography inference already done, skipping...')
-
-    # -------------------------------------------------
-    # Post-processing and move out of working directory
-    # -------------------------------------------------
-    
-    echo('Post-processing and moving out of working directory...')
-    if not os.path.exists(out_file) or force:
-        out_cmd = 'source {}/venv/bin/activate ; scil_apply_transform_to_tractogram.py {} {} {} {} --remove_invalid {}'.format(SCIL_DIR,
-                                                                                                                               os.path.join(work_dir, 'inference_mni_2mm.trk'), 
-                                                                                                                               os.path.join(work_dir, 'T1_N4.nii.gz'), 
-                                                                                                                               os.path.join(work_dir, 'T12mni_0GenericAffine.mat'), 
-                                                                                                                               out_file,
-                                                                                                                               '-f' if force else '') # no --inverse needed per ANTs convention
-        run(out_cmd)
-    else:
-        echo('Post-processing already done, skipping...')
-
-    # -------
-    # Wrap up
-    # -------
-
-    echo('Cleaning up working directory...')
-    if not keep_work:
-        rm_cmd = 'rm -r {}'.format(work_dir)
-        run(rm_cmd)
-    else:
-        echo('User selected --keep_work, skipping...')
-
-    echo('Done!')
+    streamlines_selected = nib.streamlines.array_sequence.concatenate(streamlines_selected, axis=0)
+    streamlines_selected = streamlines_selected[:num_select]
+    sft = StatefulTractogram(streamlines_selected, reference=fod_nii, space=Space.VOX)
+    save_tractogram(sft, tck_file, bbox_valid_check=False)

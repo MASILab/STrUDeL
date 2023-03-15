@@ -6,13 +6,6 @@
 # Set Up
 
 import numpy as np
-import contextlib
-
-# Default Context (as opposed to torch.no_grad())
-
-@contextlib.contextmanager
-def default_context():
-    yield
 
 # Function Definitions
 
@@ -24,10 +17,10 @@ def vox2step(streamline_vox):
 
 def vox2trid(vox):
 
-    trid = vox - np.floor(vox) # this can be parallelized (aka already is)...
+    trid = vox - np.floor(vox)
     return trid
 
-def vox2trii(vox, img): # ...can we parallelize this? We can pack the sequence and then run through this and then unpack it!
+def vox2trii(vox, img):
 
     offset = np.transpose(np.array([[[0, 0, 0], 
                                      [1, 0, 0], 
@@ -41,11 +34,11 @@ def vox2trii(vox, img): # ...can we parallelize this? We can pack the sequence a
     trii = np.stack([coor2idx(tric[:, :, c], img) for c in range(8)], axis=1)
     return trii
 
-def coor2idx(coor, img): # Returns index of -1 for invalid coordinates
+def coor2idx(coor, img): # Convert 3D grid coordinates to linear indices
 
     invalid_idx = np.logical_or(np.any(coor < 0, axis=1), np.any(coor > img.shape, axis=1))
     idx = np.ravel_multi_index(tuple(np.transpose(coor, axes=(1, 0))), img.shape, mode='clip')
-    idx[invalid_idx] = -1
+    idx[invalid_idx] = -1 # Return index of -1 for invalid coordinates
     return idx
 
 def triinterp(img, trid, trii, fourth_dim=True):
