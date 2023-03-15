@@ -87,11 +87,11 @@ def triinterp(img, trid, trii, fourth_dim=True):
 
     return c
 
-def streamline2network(streamline_vox, t1_img):
+def streamline2network(streamline_vox, img):
 
     streamline_step = vox2step(streamline_vox)          # Cartesian steps 1,...,n-1
     streamline_trid = vox2trid(streamline_vox)          # Distance between two nearest voxels 1,...,n
-    streamline_trii = vox2trii(streamline_vox, t1_img)  # Raveled indices for neighboring 8 voxels 1,...,n
+    streamline_trii = vox2trii(streamline_vox, img)     # Raveled indices for neighboring 8 voxels 1,...,n
 
     return streamline_trid[:-1, :], streamline_trii[:-1, :], streamline_step
 
