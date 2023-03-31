@@ -191,4 +191,6 @@ This script implements the tracking design described in the [CoRNN paper](#autho
 
 ### Visualize the results
 
-The tractograms, both the ground truth and the predicted, can be visualized in `mrview`, provided by MRTrix3. Note that the FOV of the dMRI image does not include the cerebellum, so the fibers there are largely missing or poorly defined.
+The tractograms, both the ground truth and the predicted, can be visualized in `mrview` provided by MRTrix3 or `MI-Brain` by Imeka. Note that the FOV of the dMRI image does not include the cerebellum, so the fibers there are largely missing or poorly defined.
+
+![example_tractograms](https://github.com/MASILab/STrUDeL/blob/master/example.png?raw=true)
