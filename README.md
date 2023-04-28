@@ -6,7 +6,7 @@ This repository contains implementations for training recurrent neural network m
 
 If you use this code base in your work, please cite the following papers:
 
-* **The STrUDeL paper:** [Leon Y. Cai](mailto:leon.y.cai@vanderbilt.edu), Ho Hin Lee, Nancy R. Newlin, Michael E. Kim, Daniel Moyer, Francois Rheault, Kurt G. Schilling, and Bennett A. Landman. [Implementation considerations for deep learning with diffusion MRI streamline tractography](https://www.biorxiv.org/content/10.1101/2023.04.03.535465v1). *In Submission*. 2023.
+* **The STrUDeL paper:** [Leon Y. Cai](mailto:leon.y.cai@vanderbilt.edu), Ho Hin Lee, Nancy R. Newlin, Michael E. Kim, Daniel Moyer, Francois Rheault, Kurt G. Schilling, and Bennett A. Landman. [Implementation considerations for deep learning with diffusion MRI streamline tractography](https://www.biorxiv.org/content/10.1101/2023.04.03.535465v1). Proceedings of Machine Learning Reseach. In press. 2023.
 
 * **The CoRNN paper:** Leon Y. Cai, Ho Hin Lee, Nancy R. Newlin, Cailey I. Kerley, Praitayini Kanakaraj, Qi Yang, Graham W. Johnson, Daniel Moyer, Kurt G. Schilling, Francois Rheault, and Bennett A. Landman. [Convolutional-recurrent neural networks approximate diffusion tractography from T1-weighted MRI and associated anatomical context](https://www.biorxiv.org/content/10.1101/2023.02.25.530046v2). Proceedings of Machine Learning Reseach. In press. 2023.
 
