@@ -44,7 +44,7 @@ if not os.path.exists(tboard_dir):
 
 # Train
 
-device = torch.device('cuda:1' if torch.cuda.is_available() else 'cpu')
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 rnn    = RecurrentModel(45, fc_width=512, fc_depth=4, rnn_width=512, rnn_depth=2).to(device)
 loss   = CosineLoss()
 opt    = optim.Adam(list(rnn.parameters()), lr=1e-3)
