@@ -23,6 +23,7 @@ Clone the STrUDeL repository and install the dependencies.
 ```
 git clone https://github.com/MASILab/STrUDeL.git
 cd STrUDeL
+git checkout v1.0
 python3 -m venv venv
 source venv/bin/activate
 pip install dipy==1.5.0
